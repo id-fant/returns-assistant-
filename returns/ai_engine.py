@@ -1,8 +1,10 @@
 import os
 import google.generativeai as genai
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / '.env')
+
 
 # Configure Gemini once at module load time
 # os.getenv reads from your .env file via python-dotenv
