@@ -1,30 +1,36 @@
+"""
+Gemini wrapper for the returns assistant.
+
+The view layer calls `get_return_decision(product, reason)` and receives a
+`(decision, explanation)` tuple. Decisions are restricted to the values in
+`ReturnRequest.Decision` so the model's choices are the single source of truth.
+"""
+
+import logging
 import os
-import google.generativeai as genai
+import re
 from pathlib import Path
+
+import google.generativeai as genai
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / '.env')
+from .models import ReturnRequest
 
+logger = logging.getLogger(__name__)
 
-# Configure Gemini once at module load time
-# os.getenv reads from your .env file via python-dotenv
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-def get_return_decision(product_name: str, reason: str) -> tuple[str, str]:
-    """
-    Sends return request details to Gemini and parses the response.
+# Decisions Gemini is allowed to emit. PENDING is reserved for the pre-AI
+# default on the model and is not a valid AI output.
+_VALID_AI_DECISIONS = {
+    ReturnRequest.Decision.APPROVE,
+    ReturnRequest.Decision.EXCHANGE,
+    ReturnRequest.Decision.ESCALATE,
+}
 
-    Returns:
-        (decision, explanation) — e.g. ("APPROVE", "Item was damaged on arrival.")
-
-    The prompt is structured so Gemini responds in a predictable format
-    that we can reliably parse. This is basic prompt engineering.
-    """
-
-    model = genai.GenerativeModel("gemini-3-flash-preview")
-
-    prompt = f"""
+_PROMPT_TEMPLATE = """\
 You are a returns assistant for an eCommerce platform called EcoReturns.
 A customer wants to return a product. Analyse the request and decide what to do.
 
@@ -41,36 +47,89 @@ Rules:
 - ESCALATE if the reason is vague, suspicious, or outside normal return policy
 """
 
+_DECISION_RE = re.compile(r"^\s*DECISION\s*:\s*(\w+)", re.IGNORECASE | re.MULTILINE)
+_EXPLANATION_RE = re.compile(
+    r"^\s*EXPLANATION\s*:\s*(.+?)\s*$",
+    re.IGNORECASE | re.MULTILINE | re.DOTALL,
+)
+
+_model: genai.GenerativeModel | None = None
+
+
+def _get_model() -> genai.GenerativeModel:
+    """Configure Gemini and cache the model on first use."""
+    global _model
+    if _model is not None:
+        return _model
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError(
+            "GEMINI_API_KEY is not set. Add it to your .env file."
+        )
+
+    # transport="rest" avoids gRPC SSL handshake failures on Windows where
+    # the system trust store isn't picked up by gRPC's bundled OpenSSL.
+    genai.configure(api_key=api_key, transport="rest")
+    _model = genai.GenerativeModel(
+        GEMINI_MODEL,
+        generation_config={
+            # Low temperature → consistent, near-deterministic decisions
+            "temperature": 0.1,
+            # Gemini 2.5 models use "thinking" tokens that count against this
+            # budget before any visible output is emitted. Keep it generous so
+            # the EXPLANATION line is never truncated mid-sentence.
+            "max_output_tokens": 1024,
+        },
+    )
+    return _model
+
+
+def get_return_decision(product_name: str, reason: str) -> tuple[str, str]:
+    """
+    Ask Gemini to classify a return request.
+
+    Returns (decision, explanation). On any failure the decision is ESCALATE
+    so a human can review — the request is never silently dropped.
+    """
+    prompt = _PROMPT_TEMPLATE.format(product_name=product_name, reason=reason)
+
     try:
-        response = model.generate_content(prompt)
-        return _parse_response(response.text.strip())
-    except Exception as e:
-        # Fallback if the API call fails — don't crash the whole request
-        print(f"[ai_engine] Gemini API error: {e}")
-        return ("ESCALATE", "AI analysis unavailable. Manual review required.")
+        response = _get_model().generate_content(prompt)
+        raw = (response.text or "").strip()
+        if not raw:
+            raise ValueError("Empty response from Gemini")
+        return _parse_response(raw)
+    except Exception:
+        logger.exception("Gemini call failed; escalating for manual review")
+        return (
+            ReturnRequest.Decision.ESCALATE,
+            "AI analysis unavailable. Manual review required.",
+        )
 
 
 def _parse_response(raw: str) -> tuple[str, str]:
-    """
-    Parses the structured response from Gemini.
+    """Pull DECISION and EXPLANATION lines out of the Gemini response."""
+    decision = ReturnRequest.Decision.ESCALATE
+    explanation = ""
 
-    Expected format:
-        DECISION: APPROVE
-        EXPLANATION: The item arrived damaged so a refund is warranted.
+    m = _DECISION_RE.search(raw)
+    if m:
+        candidate = m.group(1).strip().upper()
+        if candidate in _VALID_AI_DECISIONS:
+            decision = candidate
 
-    Falls back gracefully if the format is unexpected.
-    """
-    decision = "ESCALATE"
-    explanation = raw  # Default: store the full raw text if parsing fails
+    m = _EXPLANATION_RE.search(raw)
+    if m:
+        explanation = m.group(1).strip()
+    else:
+        # Strip out the DECISION line — anything left is the model's prose.
+        # Drop short scraps (likely a truncated "EXPLAN…") so we don't
+        # save junk into the database.
+        leftover = _DECISION_RE.sub("", raw).strip()
+        leftover = re.sub(r"^\s*EXPLANATION\s*:?\s*", "", leftover, flags=re.IGNORECASE)
+        explanation = leftover if len(leftover) >= 20 else (
+            "AI did not return an explanation. Manual review recommended."
+        )
 
-    lines = raw.splitlines()
-    for line in lines:
-        if line.startswith("DECISION:"):
-            raw_decision = line.replace("DECISION:", "").strip().upper()
-            # Only accept known values
-            if raw_decision in ("APPROVE", "EXCHANGE", "ESCALATE"):
-                decision = raw_decision
-        elif line.startswith("EXPLANATION:"):
-            explanation = line.replace("EXPLANATION:", "").strip()
-
-    return (decision, explanation)
+    return decision, explanation

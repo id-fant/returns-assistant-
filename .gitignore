@@ -1,3 +1,17 @@
 __pycache__/
 *.pyc
-db.sqlite3
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+# SQLite databases
+*.sqlite
+*.sqlite3
+*.db
+*.db3
+
+# SQLite temporary files
+*.db-shm
+*.db-wal
+*.db-journal
